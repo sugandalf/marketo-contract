@@ -5,6 +5,7 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {IERC20Metadata} from "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
 import {IERC4626} from "@openzeppelin/contracts/interfaces/IERC4626.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 import {ERC4626Upgradeable} from "@openzeppelin/contracts-upgradeable/token/ERC20/extensions/ERC4626Upgradeable.sol";
 import {OwnableUpgradeable} from "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
 import {ReentrancyGuardUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/ReentrancyGuardUpgradeable.sol";
@@ -72,9 +73,15 @@ contract BotVault is
     mapping(bytes32 => uint256) public escrowByMarket;
     mapping(uint128 => bytes32) public orderMarket;
 
+    uint32 public performanceFeeBps;
+    address public creatorFeeRecipient;
+    uint256 public highWaterMark;
+    mapping(address => uint256) public feeShares;
+
     event TradingOperatorSet(address indexed previous, address indexed current);
     event OperatorSet(address indexed controller, address indexed operator, bool approved);
     event RedeemRequestQueued(address indexed controller, address indexed owner, uint256 shares);
+    event FeesHarvested(uint256 feeAssets, uint256 protocolShares, uint256 creatorShares, uint256 highWaterMark);
 
     modifier onlyTradingOperator() {
         _onlyTradingOperator();
@@ -98,7 +105,9 @@ contract BotVault is
         address settlement_,
         address outcomeToken_,
         string memory name_,
-        string memory symbol_
+        string memory symbol_,
+        uint32 performanceFeeBps_,
+        address creatorFeeRecipient_
     ) external initializer {
         if (
             owner_ == address(0) || operator_ == address(0) || asset_ == address(0) || factory_ == address(0)
@@ -116,6 +125,8 @@ contract BotVault is
         binaryMarketsModule = module_;
         binarySettlement = settlement_;
         outcomeToken = outcomeToken_;
+        performanceFeeBps = performanceFeeBps_;
+        creatorFeeRecipient = creatorFeeRecipient_;
         emit TradingOperatorSet(address(0), operator_);
     }
 
@@ -178,6 +189,14 @@ contract BotVault is
     }
 
     function totalAssets() public view override returns (uint256) {
+        return _nav(false);
+    }
+
+    function feeSafeNav() public view returns (uint256) {
+        return _nav(true);
+    }
+
+    function _nav(bool feeSafe) internal view returns (uint256) {
         uint256 idle = _idle();
         uint256 escrow;
         uint256 inventory;
@@ -201,21 +220,31 @@ contract BotVault is
                 try tok.balanceOf(address(this), rec.noId) returns (uint256 d) {
                     down = d;
                 } catch {}
-                inventory += up > down ? up : down;
+                if (feeSafe) {
+                    inventory += up < down ? up : down;
+                } else {
+                    inventory += up > down ? up : down;
+                }
             } catch {}
             escrow += liveEscrow;
         }
         return idle + escrow + inventory;
     }
 
+    function harvestFees() external nonReentrant {
+        _accrueFees();
+    }
+
     function deposit(uint256 assets, address receiver) public override nonReentrant returns (uint256) {
         if (assets == 0) revert Errors.InvalidAmount();
+        _accrueFees();
         if (assets > maxDeposit(receiver)) revert Errors.DepositCapExceeded();
         return super.deposit(assets, receiver);
     }
 
     function mint(uint256 shares, address receiver) public override nonReentrant returns (uint256) {
         if (shares == 0) revert Errors.InvalidAmount();
+        _accrueFees();
         uint256 assets = previewMint(shares);
         if (assets > maxDeposit(receiver)) revert Errors.DepositCapExceeded();
         return super.mint(shares, receiver);
@@ -223,6 +252,7 @@ contract BotVault is
 
     function withdraw(uint256 assets, address receiver, address owner_) public override nonReentrant returns (uint256) {
         if (assets == 0) revert Errors.InvalidAmount();
+        _accrueFees();
         if (_canClaim(owner_)) {
             return _claimAssets(assets, receiver, owner_);
         }
@@ -232,6 +262,7 @@ contract BotVault is
 
     function redeem(uint256 shares, address receiver, address owner_) public override nonReentrant returns (uint256) {
         if (shares == 0) revert Errors.InvalidAmount();
+        _accrueFees();
         if (_canClaim(owner_)) {
             uint256 assets = previewRedeem(shares);
             return _claimAssets(assets, receiver, owner_);
@@ -243,6 +274,9 @@ contract BotVault is
     function _deposit(address caller, address receiver, uint256 assets, uint256 shares) internal override {
         super._deposit(caller, receiver, assets, shares);
         _addPrincipal(receiver, assets);
+        if (highWaterMark == 0 && performanceFeeBps > 0 && totalSupply() != 0) {
+            highWaterMark = _feeSafePps();
+        }
     }
 
     function _withdraw(address caller, address receiver, address owner_, uint256 assets, uint256 shares)
@@ -250,16 +284,29 @@ contract BotVault is
         override
     {
         super._withdraw(caller, receiver, owner_, assets, shares);
-        _reducePrincipal(owner_, shares, balanceOf(owner_) + shares);
         _assertCreatorSeed();
     }
 
     function _update(address from, address to, uint256 value) internal override {
-        if (from != address(0) && to != address(0) && from != to && value != 0) {
+        if (from != address(0) && value != 0) {
             uint256 fromBal = balanceOf(from);
-            uint256 moved = fromBal == 0 ? 0 : principalOf[from] * value / fromBal;
-            principalOf[from] -= moved;
-            principalOf[to] += moved;
+            uint256 fromFee = feeShares[from];
+            uint256 feeMove = value <= fromFee ? value : fromFee;
+            uint256 prinMove = value - feeMove;
+            feeShares[from] -= feeMove;
+            if (to != address(0)) {
+                feeShares[to] += feeMove;
+            }
+            if (prinMove != 0) {
+                uint256 prinBal = fromBal - fromFee;
+                uint256 moved = prinBal == 0 ? 0 : principalOf[from] * prinMove / prinBal;
+                principalOf[from] -= moved;
+                if (to != address(0)) {
+                    principalOf[to] += moved;
+                } else {
+                    totalPrincipal -= moved;
+                }
+            }
         }
         super._update(from, to, value);
         if (from != address(0) && to != address(0) && from != to) {
@@ -272,12 +319,55 @@ contract BotVault is
         totalPrincipal += assets;
     }
 
-    function _reducePrincipal(address account, uint256 sharesOut, uint256 sharesBefore) internal {
-        if (sharesBefore == 0) return;
-        uint256 p = principalOf[account];
-        uint256 out = p * sharesOut / sharesBefore;
-        principalOf[account] = p - out;
-        totalPrincipal -= out;
+    function _virtualShares() internal pure returns (uint256) {
+        return 10 ** _DECIMALS_OFFSET;
+    }
+
+    function _feeSafePps() internal view returns (uint256) {
+        uint256 supplyVirt = totalSupply() + _virtualShares();
+        return Math.mulDiv(feeSafeNav(), 1e18, supplyVirt);
+    }
+
+    function _accrueFees() internal {
+        if (performanceFeeBps == 0) return;
+        if (totalSupply() == 0) return;
+        if (creatorFeeRecipient == address(0)) revert Errors.ZeroAddress();
+        uint32 protoBps = factory.protocolFeeBps();
+        address tre = factory.treasury();
+        if (protoBps > 0 && tre == address(0)) revert Errors.ZeroAddress();
+
+        uint256 pps = _feeSafePps();
+        if (highWaterMark == 0) {
+            highWaterMark = pps;
+            return;
+        }
+        if (pps <= highWaterMark) return;
+
+        uint256 supplyVirt = totalSupply() + _virtualShares();
+        uint256 profit = Math.mulDiv(pps - highWaterMark, supplyVirt, 1e18);
+        uint256 feeAssets = Math.mulDiv(profit, uint256(performanceFeeBps), 10_000);
+        uint256 nav = feeSafeNav();
+        uint256 minted;
+        uint256 protocolMint;
+        uint256 creatorMint;
+        if (feeAssets != 0 && nav > 1) {
+            if (feeAssets >= nav) feeAssets = nav - 1;
+            minted = Math.mulDiv(feeAssets, supplyVirt, nav + 1 - feeAssets);
+            if (minted != 0) {
+                protocolMint = Math.mulDiv(minted, uint256(protoBps), 10_000);
+                creatorMint = minted - protocolMint;
+                if (protocolMint != 0) _mintFeeShares(tre, protocolMint);
+                if (creatorMint != 0) _mintFeeShares(creatorFeeRecipient, creatorMint);
+            }
+        }
+        uint256 newPps = _feeSafePps();
+        if (newPps > highWaterMark) highWaterMark = newPps;
+        emit FeesHarvested(feeAssets, protocolMint, creatorMint, highWaterMark);
+    }
+
+    function _mintFeeShares(address to, uint256 shares) internal {
+        _mint(to, shares);
+        feeShares[to] += shares;
     }
 
     function _assertCreatorSeed() internal view {
@@ -289,7 +379,10 @@ contract BotVault is
     function _wouldBreakCreatorSeed(address account, uint256 sharesOut) internal view returns (bool) {
         uint256 bal = balanceOf(account);
         if (bal == 0 || sharesOut == 0) return false;
-        uint256 out = principalOf[account] * sharesOut / bal;
+        uint256 fromFee = feeShares[account];
+        uint256 prinMove = sharesOut <= fromFee ? 0 : sharesOut - fromFee;
+        uint256 prinBal = bal - fromFee;
+        uint256 out = prinBal == 0 || prinMove == 0 ? 0 : principalOf[account] * prinMove / prinBal;
         uint256 newCreator = principalOf[owner()];
         if (account == owner()) newCreator -= out;
         uint256 newTotal = totalPrincipal - out;
@@ -332,6 +425,7 @@ contract BotVault is
         if (shares == 0) revert Errors.InvalidAmount();
         if (controller == address(0) || owner_ == address(0)) revert Errors.ZeroAddress();
         if (!_isAuthorized(owner_)) revert Errors.Unauthorized();
+        _accrueFees();
         if (shares > _unlockedShares(owner_)) revert Errors.InvalidAmount();
         if (_wouldBreakCreatorSeed(owner_, shares)) revert Errors.CreatorSeedRequired();
         lockedShares[owner_] += shares;
@@ -393,7 +487,6 @@ contract BotVault is
         lockedShares[owner_] -= shares;
         reservedForClaims -= assets;
         super._withdraw(msg.sender, receiver, owner_, assets, shares);
-        _reducePrincipal(owner_, shares, balanceOf(owner_) + shares);
         _assertCreatorSeed();
     }
 
@@ -568,6 +661,7 @@ contract BotVault is
         tok.approve(binarySettlement, id, amount);
         IBinarySettlement(binarySettlement).redeem(marketId, outcomeIdx, amount);
         tok.approve(binarySettlement, id, 0);
+        _accrueFees();
     }
 
     function trackedMarketCount() external view returns (uint256) {

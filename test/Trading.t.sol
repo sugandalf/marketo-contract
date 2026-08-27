@@ -304,12 +304,12 @@ contract ReentrancyTest is VaultTestBase {
         settlement = new MockSettlement(IERC20(address(tok)), module, outcomes);
         module.setMarket(MARKET_ID, address(pool), YES_ID, NO_ID, 1);
         vm.prank(admin);
-        factory = new VaultFactory(address(module), address(settlement), address(outcomes));
+        factory = new VaultFactory(address(module), address(settlement), address(outcomes), treasury);
 
         tok.mint(creator, 50 ether);
         vm.startPrank(creator);
         tok.approve(address(factory), SEED);
-        BotVault vault = BotVault(factory.createVault(operator, address(tok), "v", "v", SEED));
+        BotVault vault = BotVault(factory.createVault(operator, address(tok), "v", "v", SEED, FEE_BPS, creator));
         vm.stopPrank();
 
         tok.setTarget(address(vault), true);

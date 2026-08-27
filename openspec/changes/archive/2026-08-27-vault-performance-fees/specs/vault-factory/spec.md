@@ -1,10 +1,4 @@
-# vault-factory Specification
-
-## Purpose
-
-Registers each bot by deploying an isolated vault that the creator must seed, that depositors can find and fund up to an admin-set principal cap, with a one-to-one operator-to-vault mapping for the frontend list.
-
-## Requirements
+## MODIFIED Requirements
 
 ### Requirement: Permissionless vault creation with creator seed
 The factory MUST allow any caller to create a vault by supplying a non-zero trading-operator address, share name, share symbol, the venue collateral asset, a non-zero seed asset amount, a `performanceFeeBps` in `[0, maxPerformanceFeeBps]`, and a creator fee recipient. Creation MUST deploy a new vault, bind that operator to it, set the caller as the vault owner, configure that vault's `performanceFeeBps` and `creatorFeeRecipient`, pull `seedAssets` from the caller into the vault, mint the corresponding ERC-4626 shares to the caller, initialize the vault high-water mark so the seed is not profit, and emit a `VaultCreated` event that includes the vault address, owner, operator, asset, seed, `performanceFeeBps`, and `creatorFeeRecipient`. Creation MUST revert with a named error if the operator is the zero address, the asset is the zero address, `seedAssets` is zero, the caller cannot fund the seed, that operator already has a vault, `performanceFeeBps` exceeds `maxPerformanceFeeBps`, `performanceFeeBps > 0` and `creatorFeeRecipient` is the zero address, or `performanceFeeBps > 0` and `protocolFeeBps > 0` and treasury is the zero address. Vault owner and operator MUST NOT change `performanceFeeBps` or `creatorFeeRecipient` after creation.
@@ -37,46 +31,7 @@ The factory MUST allow any caller to create a vault by supplying a non-zero trad
 - **WHEN** a caller creates a vault with `performanceFeeBps` equal to 0 and a zero or non-zero `creatorFeeRecipient`
 - **THEN** the vault is deployed and later harvest mints no fee shares
 
-### Requirement: One vault per operator
-The factory MUST enforce a 1:1 mapping from trading operator to vault. A second create for the same operator MUST revert with a named error. Distinct operators MUST receive distinct vaults. Vault capital MUST NOT be shared across operators.
-
-#### Scenario: Duplicate operator reverts
-- **WHEN** a vault already exists for operator `O` and a caller creates another vault for `O`
-- **THEN** the call reverts with a named error and the original vault is unchanged
-
-#### Scenario: Distinct operators are isolated
-- **WHEN** callers create vaults for operators `O1` and `O2`
-- **THEN** two different vault addresses are recorded and neither vault can move the other's assets
-
-### Requirement: Enumerable registry
-The factory MUST expose views that return the vault for an operator, the operator for a vault, the number of vaults, and the vault at a given index, without reverting for in-range indexes. Out-of-range index MUST revert with a named error. The frontend MUST be able to list every registered bot as a vault address using only these views.
-
-#### Scenario: List after two creates
-- **WHEN** two vaults have been created
-- **THEN** `vaultCount()` is 2 and `vaultAt(0)` and `vaultAt(1)` return those addresses
-
-#### Scenario: Out-of-range index reverts
-- **WHEN** `vaultAt(n)` is called with `n >= vaultCount()`
-- **THEN** the call reverts with a named error
-
-### Requirement: Admin-only deposit cap
-The factory MUST store a global `depositCapBps` used by every vault, default **50000** (500% of creator principal). Only the factory admin MUST be able to change it, via a state-changing setter that emits an event with the old and new values. The setter MUST revert with a named error if the caller is not the admin or if the new value is below **10000** (100%) or above **1000000** (10000%). Vault owners and trading operators MUST NOT be able to change the cap. Vaults MUST read the live factory value on deposit so an admin change applies immediately. Lowering the cap MUST NOT force withdrawals; it MUST only block new principal that would exceed the new cap.
-
-#### Scenario: Default cap is 500%
-- **WHEN** the factory is deployed and a creator seeds 10 asset units
-- **THEN** `depositCapBps` is 50000 and third-party principal is accepted until total principal would exceed 50
-
-#### Scenario: Admin updates cap
-- **WHEN** the factory admin sets `depositCapBps` to a value in [10000, 1000000]
-- **THEN** the stored cap updates, an event is emitted, and subsequent vault `maxDeposit` uses the new value
-
-#### Scenario: Non-admin cannot change cap
-- **WHEN** a vault owner, trading operator, or any non-admin calls the cap setter
-- **THEN** the call reverts with a named error and `depositCapBps` is unchanged
-
-#### Scenario: Out-of-range cap reverts
-- **WHEN** the admin sets `depositCapBps` to 9999 or 1000001
-- **THEN** the call reverts with a named error
+## ADDED Requirements
 
 ### Requirement: Admin-only treasury and protocol take
 The factory MUST store `treasury` (Merkato fee recipient) and `protocolFeeBps` (share of each vault's crystallized performance fee minted to treasury). Default `protocolFeeBps` MUST be **2000** (20% of the performance fee). Only the factory admin MUST be able to set `treasury` and `protocolFeeBps`. Setting treasury to the zero address MUST revert with a named error if `protocolFeeBps > 0`. Setting `protocolFeeBps` above **10000** MUST revert with a named error. Vault owners and trading operators MUST NOT change these values. Vaults MUST read the live factory treasury and `protocolFeeBps` at crystallization. Changing them MUST NOT rewrite already-minted fee shares.

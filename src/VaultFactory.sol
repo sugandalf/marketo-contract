@@ -18,8 +18,14 @@ contract VaultFactory is Ownable, IVaultFactory {
     uint32 public constant DEFAULT_CAP_BPS = 50_000;
     uint32 public constant MIN_CAP_BPS = 10_000;
     uint32 public constant MAX_CAP_BPS = 1_000_000;
+    uint32 public constant DEFAULT_PROTOCOL_FEE_BPS = 2_000;
+    uint32 public constant DEFAULT_MAX_PERFORMANCE_FEE_BPS = 2_000;
+    uint32 public constant MAX_PROTOCOL_FEE_BPS = 10_000;
 
     uint32 public override depositCapBps;
+    uint32 public override protocolFeeBps;
+    uint32 public override maxPerformanceFeeBps;
+    address public override treasury;
     address public immutable IMPLEMENTATION;
     address public immutable BINARY_MARKETS_MODULE;
     address public immutable BINARY_SETTLEMENT;
@@ -30,18 +36,32 @@ contract VaultFactory is Ownable, IVaultFactory {
     address[] private _vaultList;
 
     event VaultCreated(
-        address indexed vault, address indexed owner, address indexed operator, address asset, uint256 seed
+        address indexed vault,
+        address indexed owner,
+        address indexed operator,
+        address asset,
+        uint256 seed,
+        uint32 performanceFeeBps,
+        address creatorFeeRecipient
     );
     event DepositCapBpsSet(uint32 indexed previous, uint32 indexed current);
+    event TreasurySet(address indexed previous, address indexed current);
+    event ProtocolFeeBpsSet(uint32 indexed previous, uint32 indexed current);
+    event MaxPerformanceFeeBpsSet(uint32 indexed previous, uint32 indexed current);
 
-    constructor(address module_, address settlement_, address outcomeToken_) Ownable(msg.sender) {
-        if (module_ == address(0) || settlement_ == address(0) || outcomeToken_ == address(0)) {
+    constructor(address module_, address settlement_, address outcomeToken_, address treasury_) Ownable(msg.sender) {
+        if (
+            module_ == address(0) || settlement_ == address(0) || outcomeToken_ == address(0) || treasury_ == address(0)
+        ) {
             revert Errors.ZeroAddress();
         }
         BINARY_MARKETS_MODULE = module_;
         BINARY_SETTLEMENT = settlement_;
         OUTCOME_TOKEN = outcomeToken_;
         depositCapBps = DEFAULT_CAP_BPS;
+        protocolFeeBps = DEFAULT_PROTOCOL_FEE_BPS;
+        maxPerformanceFeeBps = DEFAULT_MAX_PERFORMANCE_FEE_BPS;
+        treasury = treasury_;
 
         BotVault impl = new BotVault();
         IMPLEMENTATION = address(impl);
@@ -59,16 +79,46 @@ contract VaultFactory is Ownable, IVaultFactory {
         emit DepositCapBpsSet(prev, bps);
     }
 
+    function setTreasury(address treasury_) external {
+        if (msg.sender != owner()) revert Errors.Unauthorized();
+        if (treasury_ == address(0) && protocolFeeBps > 0) revert Errors.ZeroAddress();
+        address prev = treasury;
+        treasury = treasury_;
+        emit TreasurySet(prev, treasury_);
+    }
+
+    function setProtocolFeeBps(uint32 bps) external {
+        if (msg.sender != owner()) revert Errors.Unauthorized();
+        if (bps > MAX_PROTOCOL_FEE_BPS) revert Errors.InvalidAmount();
+        if (bps > 0 && treasury == address(0)) revert Errors.ZeroAddress();
+        uint32 prev = protocolFeeBps;
+        protocolFeeBps = bps;
+        emit ProtocolFeeBpsSet(prev, bps);
+    }
+
+    function setMaxPerformanceFeeBps(uint32 bps) external {
+        if (msg.sender != owner()) revert Errors.Unauthorized();
+        if (bps > DEFAULT_MAX_PERFORMANCE_FEE_BPS) revert Errors.InvalidAmount();
+        uint32 prev = maxPerformanceFeeBps;
+        maxPerformanceFeeBps = bps;
+        emit MaxPerformanceFeeBpsSet(prev, bps);
+    }
+
     function createVault(
         address operator,
         address asset,
         string calldata name_,
         string calldata symbol_,
-        uint256 seedAssets
+        uint256 seedAssets,
+        uint32 performanceFeeBps,
+        address creatorFeeRecipient
     ) external returns (address vault) {
         if (operator == address(0) || asset == address(0)) revert Errors.ZeroAddress();
         if (seedAssets == 0) revert Errors.InvalidAmount();
         if (vaults[operator] != address(0)) revert Errors.OperatorExists();
+        if (performanceFeeBps > maxPerformanceFeeBps) revert Errors.InvalidAmount();
+        if (performanceFeeBps > 0 && creatorFeeRecipient == address(0)) revert Errors.ZeroAddress();
+        if (performanceFeeBps > 0 && protocolFeeBps > 0 && treasury == address(0)) revert Errors.ZeroAddress();
 
         vault = Clones.clone(IMPLEMENTATION);
         BotVault(vault)
@@ -81,7 +131,9 @@ contract VaultFactory is Ownable, IVaultFactory {
                 BINARY_SETTLEMENT,
                 OUTCOME_TOKEN,
                 name_,
-                symbol_
+                symbol_,
+                performanceFeeBps,
+                creatorFeeRecipient
             );
 
         IERC20 token = IERC20(asset);
@@ -94,7 +146,7 @@ contract VaultFactory is Ownable, IVaultFactory {
         operatorOf[vault] = operator;
         _vaultList.push(vault);
 
-        emit VaultCreated(vault, msg.sender, operator, asset, seedAssets);
+        emit VaultCreated(vault, msg.sender, operator, asset, seedAssets, performanceFeeBps, creatorFeeRecipient);
     }
 
     function vaultCount() external view returns (uint256) {

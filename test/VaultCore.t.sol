@@ -24,12 +24,14 @@ contract VaultTestBase is Test {
     address internal operator = makeAddr("operator");
     address internal lp = makeAddr("lp");
     address internal stranger = makeAddr("stranger");
+    address internal treasury = makeAddr("treasury");
 
     bytes32 internal constant MARKET_ID = keccak256("m1");
     uint256 internal constant YES_ID = 1;
     uint256 internal constant NO_ID = 2;
     uint256 internal constant SEED = 10 ether;
     uint256 internal constant SCALE = 1e18;
+    uint32 internal constant FEE_BPS = 1_000;
 
     function _deployFactory() internal {
         asset = new MockAsset();
@@ -40,14 +42,30 @@ contract VaultTestBase is Test {
         module.setMarket(MARKET_ID, address(pool), YES_ID, NO_ID, 1);
 
         vm.prank(admin);
-        factory = new VaultFactory(address(module), address(settlement), address(outcomes));
+        factory = new VaultFactory(address(module), address(settlement), address(outcomes), treasury);
     }
 
     function _createVault(uint256 seed) internal returns (BotVault vault) {
+        return _createVault(seed, FEE_BPS, creator);
+    }
+
+    function _createVault(uint256 seed, uint32 feeBps, address feeRecipient) internal returns (BotVault vault) {
         asset.mint(creator, seed * 10);
         vm.startPrank(creator);
         asset.approve(address(factory), type(uint256).max);
-        vault = BotVault(factory.createVault(operator, address(asset), "Bot Vault", "bVAULT", seed));
+        vault =
+            BotVault(factory.createVault(operator, address(asset), "Bot Vault", "bVAULT", seed, feeBps, feeRecipient));
+        vm.stopPrank();
+    }
+
+    function _createVaultFor(address op, uint256 seed, uint32 feeBps, address feeRecipient)
+        internal
+        returns (BotVault vault)
+    {
+        asset.mint(creator, seed * 10);
+        vm.startPrank(creator);
+        asset.approve(address(factory), type(uint256).max);
+        vault = BotVault(factory.createVault(op, address(asset), "Bot Vault", "bVAULT", seed, feeBps, feeRecipient));
         vm.stopPrank();
     }
 }
@@ -69,6 +87,11 @@ contract VaultFactoryTest is VaultTestBase {
         assertEq(factory.vaultCount(), 1);
         assertEq(factory.vaultAt(0), address(vault));
         assertEq(factory.depositCapBps(), 50_000);
+        assertEq(factory.protocolFeeBps(), 2_000);
+        assertEq(factory.maxPerformanceFeeBps(), 2_000);
+        assertEq(factory.treasury(), treasury);
+        assertEq(vault.performanceFeeBps(), FEE_BPS);
+        assertEq(vault.creatorFeeRecipient(), creator);
     }
 
     function test_revertZeroOperator() public {
@@ -76,20 +99,20 @@ contract VaultFactoryTest is VaultTestBase {
         vm.startPrank(creator);
         asset.approve(address(factory), SEED);
         vm.expectRevert(Errors.ZeroAddress.selector);
-        factory.createVault(address(0), address(asset), "n", "s", SEED);
+        factory.createVault(address(0), address(asset), "n", "s", SEED, FEE_BPS, creator);
         vm.stopPrank();
     }
 
     function test_revertZeroAsset() public {
         vm.prank(creator);
         vm.expectRevert(Errors.ZeroAddress.selector);
-        factory.createVault(operator, address(0), "n", "s", SEED);
+        factory.createVault(operator, address(0), "n", "s", SEED, FEE_BPS, creator);
     }
 
     function test_revertZeroSeed() public {
         vm.prank(creator);
         vm.expectRevert(Errors.InvalidAmount.selector);
-        factory.createVault(operator, address(asset), "n", "s", 0);
+        factory.createVault(operator, address(asset), "n", "s", 0, FEE_BPS, creator);
     }
 
     function test_revertDuplicateOperator() public {
@@ -98,7 +121,7 @@ contract VaultFactoryTest is VaultTestBase {
         vm.startPrank(creator);
         asset.approve(address(factory), SEED);
         vm.expectRevert(Errors.OperatorExists.selector);
-        factory.createVault(operator, address(asset), "n", "s", SEED);
+        factory.createVault(operator, address(asset), "n", "s", SEED, FEE_BPS, creator);
         vm.stopPrank();
     }
 
@@ -114,7 +137,7 @@ contract VaultFactoryTest is VaultTestBase {
         asset.mint(creator2, SEED);
         vm.startPrank(creator2);
         asset.approve(address(factory), SEED);
-        BotVault v2 = BotVault(factory.createVault(op2, address(asset), "v2", "v2", SEED));
+        BotVault v2 = BotVault(factory.createVault(op2, address(asset), "v2", "v2", SEED, FEE_BPS, creator2));
         vm.stopPrank();
         assertTrue(address(v1) != address(v2));
         assertEq(factory.vaultCount(), 2);
@@ -207,6 +230,9 @@ contract BotVault4626Test is VaultTestBase {
         vault.maxWithdraw(creator);
         vault.maxRedeem(creator);
         vault.share();
+        vault.feeSafeNav();
+        vault.highWaterMark();
+        vault.performanceFeeBps();
     }
 
     function test_donationDoesNotMintShares() public {

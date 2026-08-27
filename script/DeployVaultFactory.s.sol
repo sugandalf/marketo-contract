@@ -11,10 +11,13 @@ import {VaultFactory} from "../src/VaultFactory.sol";
 ///                     BinarySettlement    0xbF4a49e0Dfd092e5FBE8E5761064C49533e6Ed23
 ///                     OutcomeToken6909    0xB52c5934113Af5c0Bb20eb3C72290C8215f755b9
 contract DeployVaultFactory is Script {
-    function run(address module, address settlement, address outcomeToken) external returns (VaultFactory factory) {
+    function run(address module, address settlement, address outcomeToken, address treasury)
+        external
+        returns (VaultFactory factory)
+    {
         uint256 pk = vm.envUint("PRIVATE_KEY");
         vm.startBroadcast(pk);
-        factory = new VaultFactory(module, settlement, outcomeToken);
+        factory = new VaultFactory(module, settlement, outcomeToken, treasury);
         vm.stopBroadcast();
     }
 }
