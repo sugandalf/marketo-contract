@@ -1,0 +1,11 @@
+{
+  "name": "@marketo/vault-adapter",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Operator-only adapter: sign as the bot, trade as the vault.",
+  "peerDependencies": {
+    "viem": "^2.0.0",
+    "@somnia-chain/markets-sdk": ">=0.28.0"
+  }
+}
