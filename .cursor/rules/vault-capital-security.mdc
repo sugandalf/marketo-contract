@@ -1,0 +1,31 @@
+---
+description: Fail-closed security for vaults that hold depositor capital
+globs: "{src,test,script}/**/*.sol"
+alwaysApply: true
+---
+
+# Vault capital security
+
+- Fail closed on writes. ERC-4626 **views** (`max*`, `preview*`, `convert*`, `totalAssets`) MUST NOT revert — return 0 / the limited max. `deposit`/`mint`/`withdraw`/`redeem` still revert when the full amount cannot complete.
+
+## Fail closed
+
+```solidity
+// ❌ BAD — proceeds or clamps on invalid state
+if (assets > max) assets = max;
+
+// ✅ GOOD — named revert, no silent success
+if (assets == 0 || assets > maxWithdrawable[msg.sender]) revert InvalidAmount();
+```
+
+## Access and capital
+
+- Every state-changing function names its caller (depositor, operator, owner). Anyone else reverts.
+- Operator may trade only with idle vault capital (place/cancel/reduce, mint/merge, redeem). Operator cannot withdraw, rescue, or send tokens to itself or an arbitrary address.
+- Depositors withdraw only their own claim. No path for a third party to drain, skim, or inflate shares.
+- Checks-effects-interactions. `nonReentrant` on value-moving functions. Allowances only to allowlisted venue contracts, never `type(uint256).max` to unknown spenders.
+- Do not treat `token.balanceOf(address(this))` or raw `msg.value` as the deposit amount; measure the transfer delta. Do not trust operator-supplied pool/market/token ids without venue + `marketId` checks.
+
+## After every update
+
+Audit the diff for: missing access control, token flows to unexpected recipients, reentrancy, approval scope, share inflation / donation attacks, and any branch that does not revert when preconditions fail. Add a Foundry test that `vm.expectRevert`s each new invalid path (unauthorized caller, over-withdraw, insolvent trade).

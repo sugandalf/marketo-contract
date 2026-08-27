@@ -1,0 +1,180 @@
+schema: spec-driven
+
+# Project context (optional)
+# This is shown to AI when creating artifacts.
+# Add your tech stack, conventions, style guides, domain knowledge, etc.
+context: |
+  Product: Marketo — per-bot vault contracts that copy-trade DreamDEX event contracts
+  on Somnia. Each bot gets its own deployed vault. Other users deposit into that vault.
+  The bot may trade only with capital held by its vault; it must never pull from
+  depositors' wallets or mix in the operator EOA's own funds.
+
+  Docs: https://docs.dreamdex.io/developers/event-contracts
+  Venue: Somnia Markets on-chain CLOB (event contracts). HTTP API is spot-only;
+  event-contract trading is on-chain + `@somnia-chain/markets-sdk` (>= 0.28.0).
+
+  Architecture
+  - One vault contract per bot, deployed from the frontend (factory or dedicated deploy).
+  - Each vault is an ERC-4626 tokenized vault (EIP-4626): depositors hold ERC-20 shares
+    of a single underlying asset (venue collateral). No custom deposit/withdraw API as
+    the primary interface — wallets, aggregators, and the frontend speak IERC4626.
+  - The vault is the trading identity (order owner / escrow source). The bot is an
+    authorized operator of that vault, not a custodian of user wallets.
+  - Operator permissions: place, cancel, reduce, mint/merge complete sets, redeem.
+    Operator cannot withdraw depositor funds to itself. Withdrawals belong to depositors
+    via ERC-4626 withdraw/redeem (and ERC-7540 requestRedeem if capital is locked).
+  - Trading capital = vault collateral + vault-held outcome tokens + vault escrow
+    on the pool. Check vault balances before signing; an underfunded order reverts
+    and still burns gas.
+
+  Event-contract domain (DreamDEX / Somnia Markets)
+  - Binary Up/Down on a single book quoted in Up probability in (0, 1).
+    Down price is always 1 − Up. Crossing Buy Up × Buy Down mints a complete set
+    (no seller needed); Sell Up × Sell Down burns a pair.
+  - Collateral: mainnet USDso (18 decimals, 0x00000022dA000002656c64D9eA6011ea952D008A);
+    testnet tUSDC (6 decimals, 0x70a86D8842FB63C4Ad2b7cdddF530eBf1BB25d8E).
+    Always derive scale from token.decimals(); a testnet constant misprices mainnet.
+  - Core (CREATE3, same on testnet 50312 and mainnet 5031):
+      BinaryMarketsModule 0x3ecC694Cef705358864a646142ac17A90E29e388
+      MarketsCore         0x2802504314685D89bF6C992CA5a8e7cC78bc0294
+      BinarySettlement    0xbF4a49e0Dfd092e5FBE8E5761064C49533e6Ed23
+      OutcomeToken6909    0xB52c5934113Af5c0Bb20eb3C72290C8215f755b9
+      OracleHub           0xe40db387cC98601Dd11bd634fF2f3AD5686dE32b
+      CollateralRouter    0xbC0C9834B15ACE38bB50dDaa7d7f7C7CC4DC183C
+  - Outcome positions are ERC-6909 token ids on the shared singleton, not ERC-20s.
+  - Key vault/bot state by marketId or symbol, never by pool address (pools recycle
+    across successive windows of a series).
+  - Lifecycle: Listed(0) → Trading(1) → Locked(2) → Resolved(4) | Voided(5).
+    Only Trading accepts orders. Gate every write on live on-chain status; the
+    indexer lags. Skip windows with little expiry headroom.
+  - Buys escrow collateral (vault-first, then wallet). Sells escrow outcome tokens.
+    Refunds return to the trading identity (the vault). Mint 1 collateral ⇄ 1 Up + 1 Down.
+  - Settled markets leave loadMarkets(); redeem via listBinaryMarkets status Finalized.
+    Voided: redeem both sides at 0.5. Losing redeem pays 0 and does not revert.
+  - Orders need expireTimestampNs (nanoseconds, future, ≤ market expiry). 0 reverts.
+    Taker bots should use IOC so unfilled size does not rest with escrow locked.
+  - Scope markets by venue id. Snap prices to the tick grid and sizes to the lot grid.
+  - Confirm core addresses on-chain before real funds; never hardcode market/pool
+    addresses — read them from BinaryMarketsModule.markets(marketId) or the SDK.
+
+  Vault standard (ERC-4626)
+  - Implement IERC4626 as defined in https://eips.ethereum.org/EIPS/eip-4626.
+    Baseline: OpenZeppelin ERC4626 (or equivalent) with decimal/virtual-offset
+    inflation-attack protection. Do not roll a custom share-math from scratch.
+  - asset() is the venue collateral ERC-20 (USDso 18 on mainnet, tUSDC 6 on testnet).
+    The vault token IS the share token (share() == address(this)); do not use
+    ERC-7575 multi-asset vaults — one collateral, one share ERC-20.
+  - totalAssets() is NAV in asset units: idle collateral + venue escrow + outcome
+    inventory valued in collateral. MUST NOT revert. Do not treat raw
+    asset.balanceOf(vault) as NAV (donation/inflation and escrow would lie).
+  - convertToShares / convertToAssets / preview* / max* are views and MUST NOT revert
+    (EIP-4626). Fail-closed applies to state-changing calls, not these views.
+  - deposit/mint MUST revert if the full amount cannot be taken (allowance, limit,
+    zero, receiver). withdraw/redeem MUST revert if the full amount cannot be paid
+    (insufficient shares, exceeds maxWithdraw, insufficient idle collateral).
+    No partial fills. Emit Deposit / Withdraw per the spec.
+  - maxWithdraw / maxRedeem report only instantly liquid collateral (idle, not in
+    open orders or unsold outcome tokens), capped by the owner's share claim.
+    Deployed capital is not withdrawable until it is free.
+  - If depositors must exit while capital is in the venue, add ERC-7540 async redeem
+    (requestRedeem → claim via redeem/withdraw). Do not invent a custom withdrawal
+    queue. Deposits stay synchronous ERC-4626 unless a change explicitly requires
+    ERC-7540 async deposit. ERC-7540 setOperator is a *depositor* claim-operator,
+    not the bot trading operator — keep those roles distinct.
+  - Rounding favors the vault (depositors receive fewer shares / assets on the edges).
+    First-depositor inflation is mitigated by the OZ decimal offset (or equivalent
+    dead shares). Unsolicited ERC-20/6909 transfers must not mint shares.
+  - ERC-165: report IERC4626 (and IERC7575Share if share() == address(this)).
+    Frontend and bots integrate through the 4626 surface, not ad-hoc getters.
+
+  Tech stack
+  - Smart contracts: Foundry (forge, cast, anvil), Solidity ^0.8.x, forge-std,
+    OpenZeppelin Contracts (ERC20, ERC4626, ERC165, ReentrancyGuard).
+    Layout: src/, test/, script/. Format with `forge fmt`. Tests with `forge test`.
+  - Bots / frontend integration: TypeScript, viem, `@somnia-chain/markets-sdk` >= 0.28.0.
+    SDK ABIs (binaryModuleReadAbi, binaryModuleWriteAbi, erc6909Abi, …) can be reused
+    from a Solidity/Foundry client; do not depend on the spot HTTP API for events.
+  - Chain: Somnia mainnet 5031 (RPC https://api.infra.mainnet.somnia.network),
+    Shannon testnet 50312 (RPC https://dream-rpc.somnia.network).
+  - SPDX: MIT unless a change says otherwise. Prefer named errors over require strings.
+
+  Conventions
+  - Vaults are isolated: one bot, one vault, one operator set. No shared pot across bots.
+  - Do not send the operator private key as the SDK `privateKey` against user wallets;
+    the vault (or placeOrderFor on the vault as owner) is the only funded trader.
+  - Invariants to preserve: depositor funds never leave except via depositor withdraw,
+    settlement redeem into the vault, or venue escrow for vault-owned orders.
+  - Frontend lists bots → each row is a vault address users can deposit into.
+
+  Security (depositor capital — fail closed)
+  - This repo holds other people's money. Every write path is untrusted until proven
+    otherwise. After any code change, audit before considering the work done.
+  - Fail closed: if a precondition is missing or a postcondition would not hold,
+    revert with a named error. Never proceed, clamp silently, return a zero, or
+    skip a check. No silent success on invalid state. Exception: ERC-4626 view
+    functions (asset, totalAssets, convert*, preview*, max*) MUST NOT revert;
+    they report 0 or the limited max instead. Mutative 4626 calls still revert.
+  - Access control: every state-changing function names who may call it
+    (depositor, operator, owner). Unauthorized callers revert. Operator cannot
+    withdraw, rescue, or retarget funds to itself or an arbitrary address.
+  - Capital isolation: no path lets a bad actor drain, skim, donate-attack, or
+    reenter into depositor balances. Checks-effects-interactions; CEI +
+    nonReentrant on value-moving functions. No unbounded approvals to unknown
+    spenders; allowlist venue contracts only.
+  - Accounting: shares/assets cannot inflate from unsolicited transfers. Rounding
+    favors the vault, not the attacker. Withdrawals cannot exceed the caller's
+    claim. Trade/escrow cannot spend more than idle vault capital.
+  - Trust boundaries: do not trust calldata amounts, market/pool addresses, or
+    token ids from the operator without validating they belong to the configured
+    venue and marketId. Do not trust msg.value / token.balanceOf as the deposit
+    amount without measuring the delta.
+  - Audit after every update: auth (who can call), value flow (where tokens go),
+    reentrancy, approval/allowance, share inflation, oracle/status gating, and
+    missing reverts on invalid conditions. Add a Foundry test that proves each
+    new revert and that unauthorized / insolvent calls revert.
+
+# Per-artifact rules (optional)
+# Add custom rules for specific artifacts.
+rules:
+  proposal:
+    - Keep proposals under 500 words
+    - Always include a "Non-goals" section
+    - State how depositors, the bot operator, and the vault relate (who holds funds, who can trade)
+    - Call out DreamDEX event-contract constraints that bound the change
+    - Call out capital-risk threats this change must not introduce (unauthorized access, drain, missing reverts)
+    - Treat IERC4626 as the depositor interface; justify any ERC-7540 async redeem
+  specs:
+    - Requirements must be testable on-chain (deposits, operator-only trading, capital isolation)
+    - Spec vault behavior separately from bot strategy; this repo owns contracts, not alpha
+    - Include MUST revert requirements for unauthorized callers and invalid state
+    - Cover capital-loss threats: drain, skim, share inflation, reentrancy, rogue spender
+    - Spec ERC-4626 deposit/mint/withdraw/redeem, maxWithdraw liquidity, and totalAssets NAV
+  design:
+    - Identify the trading identity (the vault) vs the operator key
+    - Do not hardcode market or pool addresses; key state by marketId or symbol
+    - Account for collateral decimal differences (USDso 18 vs tUSDC 6)
+    - Describe how the vault talks to BinaryMarketsModule / pool / OutcomeToken6909
+    - List every state-changing function with caller role and the reverts it MUST fire
+    - Call out checks-effects-interactions, reentrancy, and allowance scope
+    - Show ERC-4626 share math (offset, rounding), idle vs deployed capital in maxWithdraw,
+      and whether ERC-7540 async redeem is in or out of scope
+  tasks:
+    - Break tasks into chunks of max 2 hours
+    - Include Foundry tests for deposit, unauthorized trade, and operator happy path
+    - Include negative tests: unauthorized access, over-withdraw, invalid market, reentrancy
+    - Include ERC-4626 tests: deposit/mint/withdraw/redeem, preview vs actual, inflation attack, maxWithdraw when capital is escrowed
+    - End implementation with an explicit security-audit task before marking the change done
+
+# Per-operation guidance (optional)
+# Add advisory guidance for how apply and archive work should be conducted.
+# This is separate from artifact rules above.
+operations:
+  apply:
+    guidance:
+      - Prefer forge test coverage for vault accounting and operator auth before expanding scope
+      - After every code update, audit for unauthorized access, capital-loss paths, and missing reverts; do not finish while any of those remain
+      - Every invalid condition must revert with a named error; add a test that expects that revert
+      - Keep test summaries concise
+  archive:
+    guidance:
+      - Summarize the archive outcome before finishing

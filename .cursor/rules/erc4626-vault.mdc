@@ -1,0 +1,16 @@
+---
+description: ERC-4626 is the vault depositor interface (EIP-4626)
+globs: "{src,test,script}/**/*.sol"
+alwaysApply: true
+---
+
+# ERC-4626 vault standard
+
+Depositor entry/exit is [EIP-4626](https://eips.ethereum.org/EIPS/eip-4626). Implement OpenZeppelin `ERC4626` (decimal offset against inflation). Do not invent a parallel deposit/withdraw API.
+
+- `asset()` = venue collateral (USDso / tUSDC). Vault token is the share token (`share() == address(this)`). Not ERC-7575 multi-asset.
+- `totalAssets()` = NAV in asset units (idle + escrow + outcome inventory in collateral). **MUST NOT revert.** Do not use raw `balanceOf(vault)` as NAV.
+- Views (`asset`, `totalAssets`, `convert*`, `preview*`, `max*`) **MUST NOT revert**. State-changing `deposit`/`mint`/`withdraw`/`redeem` **MUST revert** if the full amount cannot be taken or paid. No partial fills. Emit `Deposit` / `Withdraw`.
+- `maxWithdraw` / `maxRedeem` = instantly liquid idle collateral only, capped by the owner's shares. Capital in orders or unsold outcomes is not withdrawable until free.
+- Need full exit while funds are in the venue → ERC-7540 `requestRedeem`, then claim via 4626 `redeem`/`withdraw`. ERC-7540 `setOperator` is a depositor claim-operator, not the bot trader.
+- Rounding favors the vault. Unsolicited token transfers must not mint shares.
