@@ -30,7 +30,7 @@ contract VaultTestBase is Test {
     uint256 internal constant YES_ID = 1;
     uint256 internal constant NO_ID = 2;
     uint256 internal constant SEED = 10 ether;
-    uint256 internal constant SCALE = 1e18;
+    uint256 internal constant SCALE = 1e6;
     uint32 internal constant FEE_BPS = 1_000;
 
     function _deployFactory() internal {

@@ -16,12 +16,11 @@ contract TradingTest is VaultTestBase {
     function setUp() public {
         _deployFactory();
         vault = _createVault(SEED);
-        asset.mint(address(settlement), 100 ether);
         asset.mint(address(module), 100 ether);
     }
 
     function test_placeThenCancelRefundsVault() public {
-        uint256 price = 0.4e18;
+        uint256 price = 400_000;
         uint256 qty = 5 ether;
         uint256 needed = price * qty / SCALE;
         vm.prank(operator);
@@ -72,7 +71,7 @@ contract TradingTest is VaultTestBase {
     function test_nonOperatorReverts() public {
         vm.prank(stranger);
         vm.expectRevert(Errors.Unauthorized.selector);
-        vault.placeOrder(MARKET_ID, BotVault.Side.BUY_YES, 0.5e18, 1 ether, 1, 0);
+        vault.placeOrder(MARKET_ID, BotVault.Side.BUY_YES, 500_000, 1 ether, 1, 0);
         vm.prank(stranger);
         vm.expectRevert(Errors.Unauthorized.selector);
         vault.cancelOrder(MARKET_ID, 1);
@@ -94,26 +93,26 @@ contract TradingTest is VaultTestBase {
         uint256 idle = asset.balanceOf(address(vault));
         vm.prank(operator);
         vm.expectRevert(Errors.InsufficientIdle.selector);
-        vault.placeOrder(MARKET_ID, BotVault.Side.BUY_YES, 1e18, idle + 1 ether, 1, 0);
+        vault.placeOrder(MARKET_ID, BotVault.Side.BUY_YES, 1_000_000, idle + 1 ether, 1, 0);
         assertEq(asset.balanceOf(address(vault)), idle);
         asset.mint(operator, 100 ether);
         vm.prank(operator);
         vm.expectRevert(Errors.InsufficientIdle.selector);
-        vault.placeOrder(MARKET_ID, BotVault.Side.BUY_YES, 1e18, idle + 1 ether, 1, 0);
+        vault.placeOrder(MARKET_ID, BotVault.Side.BUY_YES, 1_000_000, idle + 1 ether, 1, 0);
         assertEq(asset.balanceOf(operator), 100 ether);
     }
 
     function test_unknownMarketReverts() public {
         vm.prank(operator);
         vm.expectRevert(Errors.InvalidMarket.selector);
-        vault.placeOrder(keccak256("nope"), BotVault.Side.BUY_YES, 1e18, 1 ether, 1, 0);
+        vault.placeOrder(keccak256("nope"), BotVault.Side.BUY_YES, 1_000_000, 1 ether, 1, 0);
     }
 
     function test_placeWhenNotTrading() public {
         module.setMarket(MARKET_ID, address(pool), YES_ID, NO_ID, 2);
         vm.prank(operator);
         vm.expectRevert(Errors.MarketNotTrading.selector);
-        vault.placeOrder(MARKET_ID, BotVault.Side.BUY_YES, 1e18, 1 ether, 1, 0);
+        vault.placeOrder(MARKET_ID, BotVault.Side.BUY_YES, 1_000_000, 1 ether, 1, 0);
     }
 
     function test_redeemWhenNotFinalized() public {
@@ -125,7 +124,7 @@ contract TradingTest is VaultTestBase {
     function test_zeroExpiryReverts() public {
         vm.prank(operator);
         vm.expectRevert(Errors.InvalidExpiry.selector);
-        vault.placeOrder(MARKET_ID, BotVault.Side.BUY_YES, 1e18, 1 ether, 0, 0);
+        vault.placeOrder(MARKET_ID, BotVault.Side.BUY_YES, 1_000_000, 1 ether, 0, 0);
     }
 
     function test_syncMarketUnknownReverts() public {
@@ -139,9 +138,9 @@ contract TradingTest is VaultTestBase {
         vault.setTradingOperator(op2);
         vm.prank(operator);
         vm.expectRevert(Errors.Unauthorized.selector);
-        vault.placeOrder(MARKET_ID, BotVault.Side.BUY_YES, 0.4e18, 1 ether, 1, 0);
+        vault.placeOrder(MARKET_ID, BotVault.Side.BUY_YES, 400_000, 1 ether, 1, 0);
         vm.prank(op2);
-        vault.placeOrder(MARKET_ID, BotVault.Side.BUY_YES, 0.4e18, 1 ether, 1, 0);
+        vault.placeOrder(MARKET_ID, BotVault.Side.BUY_YES, 400_000, 1 ether, 1, 0);
     }
 
     function test_strangerCannotWithdraw() public {
@@ -158,7 +157,7 @@ contract TradingTest is VaultTestBase {
 
     function test_requestRedeemWhileLockedThenClaim() public {
         vm.prank(operator);
-        vault.placeOrder(MARKET_ID, BotVault.Side.BUY_YES, 1e18, 9 ether, 1, 0);
+        vault.placeOrder(MARKET_ID, BotVault.Side.BUY_YES, 1_000_000, 9 ether, 1, 0);
         uint256 shares = vault.balanceOf(creator);
         vm.prank(creator);
         vault.requestRedeem(shares / 2, creator, creator);
@@ -215,7 +214,7 @@ contract TradingTest is VaultTestBase {
     }
 
     function test_reduceOrderRefundsVault() public {
-        uint256 price = 0.4e18;
+        uint256 price = 400_000;
         uint256 qty = 5 ether;
         uint256 needed = price * qty / SCALE;
         vm.prank(operator);
@@ -235,7 +234,7 @@ contract TradingTest is VaultTestBase {
         uint256 decoyBefore = asset.balanceOf(address(decoy));
         uint256 poolBefore = asset.balanceOf(address(pool));
         vm.prank(operator);
-        vault.placeOrder(MARKET_ID, BotVault.Side.BUY_YES, 0.5e18, 2 ether, 1, 0);
+        vault.placeOrder(MARKET_ID, BotVault.Side.BUY_YES, 500_000, 2 ether, 1, 0);
         assertEq(asset.balanceOf(address(decoy)), decoyBefore);
         assertGt(asset.balanceOf(address(pool)), poolBefore);
         assertEq(asset.balanceOf(operator), 0);
@@ -266,6 +265,44 @@ contract TradingTest is VaultTestBase {
         vm.prank(operator);
         vault.forgetMarket(MARKET_ID);
         assertEq(vault.trackedMarketCount(), 0);
+    }
+
+    function test_collateralMismatchReverts() public {
+        module.setCollateral(MARKET_ID, address(uint160(1)));
+        vm.prank(operator);
+        vm.expectRevert(Errors.InvalidMarket.selector);
+        vault.placeOrder(MARKET_ID, BotVault.Side.BUY_YES, 400_000, 1 ether, 1, 0);
+    }
+
+    function test_expiryPastMarketExpiryReverts() public {
+        pool.setMarketExpiryNs(100);
+        vm.prank(operator);
+        vm.expectRevert(Errors.InvalidExpiry.selector);
+        vault.placeOrder(MARKET_ID, BotVault.Side.BUY_YES, 400_000, 1 ether, 101, 0);
+    }
+
+    function test_reduceRemainingZeroReverts() public {
+        vm.prank(operator);
+        uint128 id = vault.placeOrder(MARKET_ID, BotVault.Side.BUY_YES, 400_000, 1 ether, 1, 0);
+        vm.prank(operator);
+        vm.expectRevert(Errors.InvalidAmount.selector);
+        vault.reduceOrder(MARKET_ID, id, 0);
+    }
+
+    function test_totalAssetsWithoutEscrowOf() public {
+        vm.prank(operator);
+        vault.placeOrder(MARKET_ID, BotVault.Side.BUY_YES, 400_000, 1 ether, 1, 0);
+        uint256 nav = vault.totalAssets();
+        assertGt(nav, asset.balanceOf(address(vault)));
+    }
+
+    function test_tusdcScaleBuyNotional() public {
+        uint256 price = 900_000;
+        uint256 qty = 1e6;
+        asset.mint(address(vault), 9e5);
+        vm.prank(operator);
+        vault.placeOrder(MARKET_ID, BotVault.Side.BUY_YES, price, qty, 1, 0);
+        assertEq(asset.balanceOf(address(vault)), SEED);
     }
 }
 
@@ -334,7 +371,7 @@ contract ReentrancyTest is VaultTestBase {
         rpool.setAttack(address(vault));
         vm.prank(operator);
         vm.expectRevert();
-        vault.placeOrder(MARKET_ID, BotVault.Side.BUY_YES, 0.4e18, 1 ether, 1, 0);
+        vault.placeOrder(MARKET_ID, BotVault.Side.BUY_YES, 400_000, 1 ether, 1, 0);
     }
 }
 

@@ -340,7 +340,9 @@ Principal and fee-originated shares move separately. Fee shares do not change `t
 
 ## 8. Trading (operator only)
 
-Vault is `msg.sender` on every venue write. Operator supplies `marketId` only. Pool, yes/no ids, and status come from `BinaryMarketsModule`. Approvals are exact-amount to allowlisted spenders, then cleared.
+Vault is `msg.sender` on every venue write. Operator supplies `marketId` only. Pool, outcome ids, origin `(operatorId, venueId)`, and collateral come from the live `BinaryMarketsModule.markets` tuple (no status field). Status is `IBinaryMarket.status()` on the per-window market. Approvals are exact-amount to allowlisted spenders, then cleared.
+
+Redeploy the factory after this ABI change; existing clones are not upgraded.
 
 ```
  Operator                    BotVault                      Venue
@@ -349,8 +351,9 @@ Vault is `msg.sender` on every venue write. Operator supplies `marketId` only. P
     |  nonReentrant             |                            |
     |                           |                            |
     |  marketId ---------------->|  module.markets(marketId) |
-    |                           |  pool == 0?                |
-    |                           |    revert InvalidMarket    |
+    |                           |  pool == 0 or collateral
+    |                           |    != asset -> InvalidMarket
+    |                           |  market.status()           |
     |                           |  _trackMarket (max 32)     |
 ```
 
@@ -360,23 +363,24 @@ Vault is `msg.sender` on every venue write. Operator supplies `marketId` only. P
  Operator ---- placeOrder(marketId, side, price, qty, expiryNs, type)
                     |
                     |  qty/price == 0  -> InvalidAmount
-                    |  expiryNs == 0   -> InvalidExpiry
-                    |  status != 1     -> MarketNotTrading
+                    |  expiryNs == 0 or > pool.marketExpiryNs()
+                    |                    -> InvalidExpiry
+                    |  status() != 1   -> MarketNotTrading
                     |
          BUY_YES / BUY_NO                    SELL_YES / SELL_NO
                     |                                   |
                     v                                   v
-         needed = price * qty / 1eD              need outcome inventory
-         idle < needed -> InsufficientIdle       (pool pulls on fill)
+         needed = price * qty / 1e6              approve 6909 to pool
+         idle < needed -> InsufficientIdle
          approve(pool, needed)
                     |                                   |
                     +----------------+------------------+
                                      v
-                         EventPool.placeOrder(...)
+                         pool.placeBinaryOrder(kind=side, …)
                          msg.sender = vault
                          order owner = vault
                                      |
-                         BUY: clear approval
+                         clear approval
                          success == false -> InvalidAmount
                          orderMarket[id] = marketId
                          idle drop  -> escrowByMarket += delta
@@ -385,14 +389,15 @@ Vault is `msg.sender` on every venue write. Operator supplies `marketId` only. P
 
 ### 8.2 Cancel / reduce
 
-Allowed while the market is Locked. Refunds return to the vault, never the operator.
+Allowed while the market is Locked. Refunds return to the vault, never the operator. Reduce sets **remaining** quantity (not a delta).
 
 ```
  Operator ---- cancelOrder(marketId, orderId)
-           or  reduceOrder(marketId, orderId, qty)
+           or  reduceOrder(marketId, orderId, remaining)
                     |
+                    |  remaining == 0 -> InvalidAmount
                     v
-              EventPool.cancelOrder / reduceOrder
+              pool.cancelOrder / pool.reduceOrder(remaining)
                     |
               idle refund -> escrowByMarket -= refund
               cancel: delete orderMarket[id]
@@ -403,11 +408,11 @@ Allowed while the market is Locked. Refunds return to the vault, never the opera
 ```
  Operator ---- mintCompleteSet(marketId, amount)
                     |
-                    |  status != Trading -> MarketNotTrading
-                    |  idle < amount     -> InsufficientIdle
+                    |  status() != Trading -> MarketNotTrading
+                    |  idle < amount       -> InsufficientIdle
                     v
               approve(module, amount)
-              BinaryMarketsModule.mintCompleteSet
+              module.mintCompleteSet(originOperatorId, originVenueId, marketId, amount)
                     |
               collateral -----> module
               YES + NO  -------> vault (ERC-6909)
@@ -419,11 +424,11 @@ Allowed while the market is Locked. Refunds return to the vault, never the opera
 ```
  Operator ---- mergeCompleteSet(marketId, amount)
                     |
-                    |  status != Trading -> MarketNotTrading
+                    |  status() != Trading -> MarketNotTrading
                     |  yes < amount or no < amount -> InvalidAmount
                     v
               approve YES + NO to module
-              BinaryMarketsModule.mergeCompleteSet
+              module.mergeCompleteSet(originOperatorId, originVenueId, marketId, amount)
                     |
               YES + NO  -------> module (burned)
               collateral ------> vault
@@ -435,27 +440,27 @@ Allowed while the market is Locked. Refunds return to the vault, never the opera
 ```
  Operator ---- redeem(marketId, outcomeIdx, amount)
                     |
-                    |  status not Resolved(4) or Voided(5)
+                    |  status() not Resolved(4) or Voided(5)
                     |    -> MarketNotFinalized
                     |  outcome balance < amount -> InvalidAmount
                     v
-              approve outcome to BinarySettlement
-              BinarySettlement.redeem
+              approve outcome to module
+              module.redeem(originOperatorId, originVenueId, marketId, outcomeIdx, amount)
                     |
-              winning / voided tokens -----> settlement
+              winning / voided tokens -----> module
               collateral ------------------> vault
               clear approval
               _accrueFees()                 (realized idle can mint fees)
 ```
 
-Voided markets redeem both sides at 0.5 collateral per contract.
+Voided markets redeem both sides at 0.5 collateral per contract. There is no `to` parameter; proceeds always return to the vault.
 
 ### 8.6 Market tracking
 
-NAV walks up to 32 tracked markets. Escrow is also refreshed from the pool when possible.
+NAV walks up to 32 tracked markets. Escrow is the idle delta from place/cancel/reduce. `escrowOf` is not used. Claimable `getWithdrawableBalance` is included in NAV (try/catch) and swept to the vault on `syncMarket`.
 
 ```
- anyone     ---- syncMarket(marketId)   track + refresh escrowOf(vault)
+ anyone     ---- syncMarket(marketId)   track + withdraw pool leftover to vault
  operator   ---- forgetMarket(marketId) only if escrow, yes, no are all 0
 ```
 
@@ -562,7 +567,7 @@ Fee recipients exit only through ERC-4626 / ERC-7540. Redeeming fee shares does 
   unknown marketId              -> InvalidMarket
   place/mint/merge not Trading  -> MarketNotTrading
   venue redeem not final        -> MarketNotFinalized
-  expiryNs == 0                 -> InvalidExpiry
+  expiryNs == 0 or > marketExpiryNs -> InvalidExpiry
   tracked markets == 32         -> TrackedMarketsCapped
 ```
 
@@ -576,7 +581,7 @@ Fee recipients exit only through ERC-4626 / ERC-7540. Redeeming fee shares does 
 | `BotVault` | `src/BotVault.sol` | ERC-4626 + ERC-7540 + operator trading identity |
 | `Errors` | `src/libraries/Errors.sol` | Named reverts |
 | `IVaultFactory` | `src/interfaces/IVaultFactory.sol` | Live cap / treasury / fee reads |
-| `IBinaryMarketsModule` | `src/interfaces/IBinaryMarketsModule.sol` | Market record, mint / merge |
-| `IEventPool` | `src/interfaces/IEventPool.sol` | Place / cancel / reduce / escrow |
-| `IBinarySettlement` | `src/interfaces/IBinarySettlement.sol` | Redeem resolved / voided outcomes |
+| `IBinaryMarketsModule` | `src/interfaces/IBinaryMarketsModule.sol` | Live market record, mint / merge / redeem |
+| `IEventPool` | `src/interfaces/IEventPool.sol` | `placeBinaryOrder` / cancel / reduce / withdraw |
+| `IBinaryMarket` | `src/interfaces/IBinaryMarket.sol` | Per-window `status()` |
 | `IOutcomeToken6909` | `src/interfaces/IOutcomeToken6909.sol` | Yes / No ERC-6909 inventory |

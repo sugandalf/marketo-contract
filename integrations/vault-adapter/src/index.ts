@@ -30,7 +30,7 @@ export const vaultAbi = [
     inputs: [
       { name: "marketId", type: "bytes32" },
       { name: "orderId", type: "uint128" },
-      { name: "quantity", type: "uint256" },
+      { name: "remaining", type: "uint256" },
     ],
     outputs: [],
   },
@@ -187,8 +187,8 @@ export function createVaultAdapter(cfg: VaultAdapterConfig) {
       orderType: number,
     ) => write("placeOrder", [marketId, side, price, quantity, expireTimestampNs, orderType]),
     cancelOrder: (marketId: `0x${string}`, orderId: bigint) => write("cancelOrder", [marketId, orderId]),
-    reduceOrder: (marketId: `0x${string}`, orderId: bigint, quantity: bigint) =>
-      write("reduceOrder", [marketId, orderId, quantity]),
+    reduceOrder: (marketId: `0x${string}`, orderId: bigint, remaining: bigint) =>
+      write("reduceOrder", [marketId, orderId, remaining]),
     mintCompleteSet: (marketId: `0x${string}`, amount: bigint) => write("mintCompleteSet", [marketId, amount]),
     mergeCompleteSet: (marketId: `0x${string}`, amount: bigint) => write("mergeCompleteSet", [marketId, amount]),
     redeem: (marketId: `0x${string}`, outcomeIdx: number, amount: bigint) =>

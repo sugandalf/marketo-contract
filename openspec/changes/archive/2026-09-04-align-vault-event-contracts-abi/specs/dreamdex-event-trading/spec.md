@@ -1,32 +1,4 @@
-# dreamdex-event-trading Specification
-
-## Purpose
-
-Lets the bot trade only as the vault against DreamDEX event contracts, with venue allowlisting, marketId checks, and fail-closed writes so depositor capital cannot leave except as escrow, settlement, or depositor exit.
-
-## Requirements
-
-### Requirement: Vault is the trading identity
-The vault contract MUST be `msg.sender` on venue writes (place, cancel, reduce, mint complete set, merge complete set, redeem). Escrow MUST be pulled from vault balances. Cancel refunds, fill proceeds, merge proceeds, and redemption proceeds MUST return to the vault. The trading operator MUST NOT be the funded trader and MUST NOT mix operator-EOA funds with vault capital.
-
-#### Scenario: Place order escrows vault collateral
-- **WHEN** the trading operator successfully places a buy through the vault
-- **THEN** collateral is escrowed from the vault (not the operator) and the order owner is the vault
-
-#### Scenario: Cancel refunds the vault
-- **WHEN** the trading operator cancels a resting vault bid
-- **THEN** escrowed collateral returns to the vault address
-
-### Requirement: Operator-only venue writes
-Place, cancel, reduce, mint complete set, merge complete set, and redeem MUST be callable only by the current trading operator and MUST revert with a named error for any other caller. Each write MUST revert with a named error on zero size, insufficient idle vault capital or outcome inventory, or when the full venue action cannot complete. The vault MUST NOT silently clamp size.
-
-#### Scenario: Non-operator place reverts
-- **WHEN** a non-operator calls place, cancel, reduce, mint, merge, or redeem
-- **THEN** the call reverts with a named error and no venue write occurs
-
-#### Scenario: Underfunded trade reverts
-- **WHEN** the operator places a buy larger than idle vault collateral
-- **THEN** the call reverts with a named error and idle balances are unchanged
+## MODIFIED Requirements
 
 ### Requirement: Market and pool validation
 Operator-supplied `marketId` MUST be validated against the configured `BinaryMarketsModule`. The vault MUST read the live module market record for that id — pool, per-window market, outcome ids, origin operator id, origin venue id, collateral, and expiry — and MUST NOT use a caller-supplied pool, market, or outcome-token address. The record's collateral MUST equal the vault `asset()`. State MUST be keyed by `marketId`, never by pool address. Approvals MUST be limited to allowlisted venue contracts (module, resolved pool, settlement, outcome token) and MUST NOT be `type(uint256).max` to unknown spenders. A `marketId` unknown to the module, a zero pool, or a collateral mismatch MUST revert with a named error.
@@ -58,12 +30,7 @@ Place, mint, and merge MUST execute only when the per-window market contract's l
 - **WHEN** a market is Resolved or Voided and the vault holds the claimable outcome
 - **THEN** the operator can redeem into the vault; on Voided both sides are redeemable at 0.5 collateral per contract
 
-### Requirement: Venue-only token flow
-Collateral and outcome tokens MUST leave the vault only to (a) allowlisted venue contracts for escrow/mint/merge/redeem, or (b) a depositor (or ERC-7540 claim-operator) via IERC4626 `withdraw`/`redeem`. Any other recipient MUST revert with a named error.
-
-#### Scenario: Operator cannot set a custom recipient
-- **WHEN** a venue write would send tokens to the operator or an arbitrary address
-- **THEN** the call reverts with a named error
+## ADDED Requirements
 
 ### Requirement: Event Contracts write surface
 Place MUST be forwarded to the resolved pool as a binary order whose `kind` is the operator-supplied side (0 BUY_YES, 1 SELL_YES, 2 BUY_NO, 3 SELL_NO). The vault MUST NOT call the generic spot `placeOrder` on a binary pool. Mint and merge MUST be forwarded to the module with the record's origin operator id and venue id plus `marketId` and amount; minted Up and Down MUST be credited to the vault. Reduce MUST set the order's remaining quantity to the operator-supplied remaining size (not a delta). Redeem MUST be forwarded to the module with those origin ids, `marketId`, outcome index, and amount, and proceeds MUST return to the vault. `expireTimestampNs` MUST be non-zero and MUST NOT exceed the market's expiry; otherwise the write MUST revert with a named error.

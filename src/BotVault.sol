@@ -2,7 +2,6 @@
 pragma solidity ^0.8.24;
 
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
-import {IERC20Metadata} from "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
 import {IERC4626} from "@openzeppelin/contracts/interfaces/IERC4626.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
@@ -15,8 +14,8 @@ import {Initializable} from "@openzeppelin/contracts-upgradeable/proxy/utils/Ini
 import {Errors} from "./libraries/Errors.sol";
 import {IVaultFactory} from "./interfaces/IVaultFactory.sol";
 import {IBinaryMarketsModule, MarketRecord} from "./interfaces/IBinaryMarketsModule.sol";
+import {IBinaryMarket} from "./interfaces/IBinaryMarket.sol";
 import {IEventPool} from "./interfaces/IEventPool.sol";
-import {IBinarySettlement} from "./interfaces/IBinarySettlement.sol";
 import {IOutcomeToken6909} from "./interfaces/IOutcomeToken6909.sol";
 
 /// @title BotVault
@@ -31,6 +30,7 @@ contract BotVault is
     using SafeERC20 for IERC20;
 
     uint8 private constant _DECIMALS_OFFSET = 3;
+    uint256 public constant PRICE_SCALE = 1e6;
     uint8 public constant STATUS_TRADING = 1;
     uint8 public constant STATUS_LOCKED = 2;
     uint8 public constant STATUS_RESOLVED = 4;
@@ -200,17 +200,31 @@ contract BotVault is
         uint256 idle = _idle();
         uint256 escrow;
         uint256 inventory;
+        uint256 withdrawable;
         uint256 n = _trackedMarkets.length;
         IBinaryMarketsModule module = IBinaryMarketsModule(binaryMarketsModule);
         IOutcomeToken6909 tok = IOutcomeToken6909(outcomeToken);
+        address[32] memory seenPools;
+        uint256 seen;
+        address asset_ = asset();
         for (uint256 i; i < n; ++i) {
             bytes32 id = _trackedMarkets[i];
-            uint256 liveEscrow = escrowByMarket[id];
+            escrow += escrowByMarket[id];
             try module.markets(id) returns (MarketRecord memory rec) {
                 if (rec.pool != address(0)) {
-                    try IEventPool(rec.pool).escrowOf(address(this)) returns (uint256 e) {
-                        liveEscrow = e;
-                    } catch {}
+                    bool dup;
+                    for (uint256 j; j < seen; ++j) {
+                        if (seenPools[j] == rec.pool) {
+                            dup = true;
+                            break;
+                        }
+                    }
+                    if (!dup && seen < 32) {
+                        seenPools[seen++] = rec.pool;
+                        try IEventPool(rec.pool).getWithdrawableBalance(address(this), asset_) returns (uint256 w) {
+                            withdrawable += w;
+                        } catch {}
+                    }
                 }
                 uint256 up;
                 uint256 down;
@@ -226,9 +240,8 @@ contract BotVault is
                     inventory += up > down ? up : down;
                 }
             } catch {}
-            escrow += liveEscrow;
         }
-        return idle + escrow + inventory;
+        return idle + escrow + withdrawable + inventory;
     }
 
     function harvestFees() external nonReentrant {
@@ -492,7 +505,32 @@ contract BotVault is
 
     function _market(bytes32 marketId) internal view returns (MarketRecord memory rec) {
         rec = IBinaryMarketsModule(binaryMarketsModule).markets(marketId);
-        if (rec.pool == address(0)) revert Errors.InvalidMarket();
+        if (rec.pool == address(0) || rec.market == address(0) || rec.collateral != asset()) {
+            revert Errors.InvalidMarket();
+        }
+    }
+
+    function _marketStatus(address market) internal view returns (uint8) {
+        return IBinaryMarket(market).status();
+    }
+
+    function _requireTrading(address market) internal view {
+        if (_marketStatus(market) != STATUS_TRADING) revert Errors.MarketNotTrading();
+    }
+
+    function _requireFinalized(address market) internal view {
+        uint8 st = _marketStatus(market);
+        if (st != STATUS_RESOLVED && st != STATUS_VOIDED) revert Errors.MarketNotFinalized();
+    }
+
+    function _noteIdleDelta(bytes32 marketId, uint256 before) internal {
+        uint256 afterBal = _idle();
+        if (before > afterBal) {
+            escrowByMarket[marketId] += before - afterBal;
+        } else if (afterBal > before) {
+            uint256 refund = afterBal - before;
+            escrowByMarket[marketId] = escrowByMarket[marketId] > refund ? escrowByMarket[marketId] - refund : 0;
+        }
     }
 
     function _trackMarket(bytes32 marketId) internal {
@@ -520,8 +558,8 @@ contract BotVault is
     function syncMarket(bytes32 marketId) external {
         MarketRecord memory rec = _market(marketId);
         _trackMarket(marketId);
-        try IEventPool(rec.pool).escrowOf(address(this)) returns (uint256 e) {
-            escrowByMarket[marketId] = e;
+        try IEventPool(rec.pool).getWithdrawableBalance(address(this), asset()) returns (uint256 w) {
+            if (w != 0) IEventPool(rec.pool).withdraw(asset(), w);
         } catch {}
     }
 
@@ -552,9 +590,8 @@ contract BotVault is
         return side == Side.BUY_YES || side == Side.BUY_NO;
     }
 
-    function _buyNotional(uint256 price, uint256 quantity) internal view returns (uint256) {
-        uint256 scale = 10 ** IERC20Metadata(asset()).decimals();
-        return (price * quantity) / scale;
+    function _buyNotional(uint256 price, uint256 quantity) internal pure returns (uint256) {
+        return (price * quantity) / PRICE_SCALE;
     }
 
     function placeOrder(
@@ -566,85 +603,82 @@ contract BotVault is
         uint8 orderType
     ) external onlyTradingOperator nonReentrant returns (uint128 orderId) {
         if (quantity == 0 || price == 0) revert Errors.InvalidAmount();
-        if (expireTimestampNs == 0) revert Errors.InvalidExpiry();
         MarketRecord memory rec = _market(marketId);
-        if (rec.status != STATUS_TRADING) revert Errors.MarketNotTrading();
+        _requireTrading(rec.market);
+        uint64 expiryCap = IEventPool(rec.pool).marketExpiryNs();
+        if (expireTimestampNs == 0 || expireTimestampNs > expiryCap) revert Errors.InvalidExpiry();
         _trackMarket(marketId);
 
         uint256 before = _idle();
+        uint256 sellId;
+        IOutcomeToken6909 tok = IOutcomeToken6909(outcomeToken);
         if (_isBuy(side)) {
             uint256 needed = _buyNotional(price, quantity);
             if (needed == 0 || before < needed) revert Errors.InsufficientIdle();
             _approveExact(rec.pool, needed);
+        } else {
+            sellId = side == Side.SELL_YES ? rec.yesId : rec.noId;
+            if (tok.balanceOf(address(this), sellId) < quantity) revert Errors.InvalidAmount();
+            tok.approve(rec.pool, sellId, quantity);
         }
 
-        bool isBid = _isBuy(side);
-        (bool success, uint128 id) =
-            IEventPool(rec.pool).placeOrder(isBid, 0, price, quantity, expireTimestampNs, orderType, 0, address(0), 0);
-        if (_isBuy(side)) _approveExact(rec.pool, 0);
+        (bool success, uint128 id) = IEventPool(rec.pool)
+            .placeBinaryOrder(uint8(side), price, quantity, expireTimestampNs, orderType, 0, address(0), 0, 0);
+        if (_isBuy(side)) {
+            _approveExact(rec.pool, 0);
+        } else {
+            tok.approve(rec.pool, sellId, 0);
+        }
         if (!success) revert Errors.InvalidAmount();
         orderId = id;
         orderMarket[id] = marketId;
-
-        uint256 afterBal = _idle();
-        if (before > afterBal) {
-            escrowByMarket[marketId] += before - afterBal;
-        } else if (afterBal > before) {
-            uint256 refund = afterBal - before;
-            escrowByMarket[marketId] = escrowByMarket[marketId] > refund ? escrowByMarket[marketId] - refund : 0;
-        }
+        _noteIdleDelta(marketId, before);
     }
 
     function cancelOrder(bytes32 marketId, uint128 orderId) external onlyTradingOperator nonReentrant {
         MarketRecord memory rec = _market(marketId);
         uint256 before = _idle();
         IEventPool(rec.pool).cancelOrder(orderId);
-        uint256 afterBal = _idle();
-        if (afterBal > before) {
-            uint256 refund = afterBal - before;
-            escrowByMarket[marketId] = escrowByMarket[marketId] > refund ? escrowByMarket[marketId] - refund : 0;
-        }
+        _noteIdleDelta(marketId, before);
         delete orderMarket[orderId];
     }
 
-    function reduceOrder(bytes32 marketId, uint128 orderId, uint256 quantity)
+    function reduceOrder(bytes32 marketId, uint128 orderId, uint256 remaining)
         external
         onlyTradingOperator
         nonReentrant
     {
-        if (quantity == 0) revert Errors.InvalidAmount();
+        if (remaining == 0) revert Errors.InvalidAmount();
         MarketRecord memory rec = _market(marketId);
         uint256 before = _idle();
-        IEventPool(rec.pool).reduceOrder(orderId, quantity);
-        uint256 afterBal = _idle();
-        if (afterBal > before) {
-            uint256 refund = afterBal - before;
-            escrowByMarket[marketId] = escrowByMarket[marketId] > refund ? escrowByMarket[marketId] - refund : 0;
-        }
+        IEventPool(rec.pool).reduceOrder(orderId, remaining);
+        _noteIdleDelta(marketId, before);
     }
 
     function mintCompleteSet(bytes32 marketId, uint256 amount) external onlyTradingOperator nonReentrant {
         if (amount == 0) revert Errors.InvalidAmount();
         MarketRecord memory rec = _market(marketId);
-        if (rec.status != STATUS_TRADING) revert Errors.MarketNotTrading();
+        _requireTrading(rec.market);
         if (_idle() < amount) revert Errors.InsufficientIdle();
         _trackMarket(marketId);
         _approveExact(binaryMarketsModule, amount);
-        IBinaryMarketsModule(binaryMarketsModule).mintCompleteSet(marketId, amount);
+        IBinaryMarketsModule(binaryMarketsModule)
+            .mintCompleteSet(rec.originOperatorId, rec.originVenueId, marketId, amount);
         _approveExact(binaryMarketsModule, 0);
     }
 
     function mergeCompleteSet(bytes32 marketId, uint256 amount) external onlyTradingOperator nonReentrant {
         if (amount == 0) revert Errors.InvalidAmount();
         MarketRecord memory rec = _market(marketId);
-        if (rec.status != STATUS_TRADING) revert Errors.MarketNotTrading();
+        _requireTrading(rec.market);
         IOutcomeToken6909 tok = IOutcomeToken6909(outcomeToken);
         if (tok.balanceOf(address(this), rec.yesId) < amount || tok.balanceOf(address(this), rec.noId) < amount) {
             revert Errors.InvalidAmount();
         }
         tok.approve(binaryMarketsModule, rec.yesId, amount);
         tok.approve(binaryMarketsModule, rec.noId, amount);
-        IBinaryMarketsModule(binaryMarketsModule).mergeCompleteSet(marketId, amount);
+        IBinaryMarketsModule(binaryMarketsModule)
+            .mergeCompleteSet(rec.originOperatorId, rec.originVenueId, marketId, amount);
         tok.approve(binaryMarketsModule, rec.yesId, 0);
         tok.approve(binaryMarketsModule, rec.noId, 0);
     }
@@ -652,15 +686,14 @@ contract BotVault is
     function redeem(bytes32 marketId, uint8 outcomeIdx, uint256 amount) external onlyTradingOperator nonReentrant {
         if (amount == 0) revert Errors.InvalidAmount();
         MarketRecord memory rec = _market(marketId);
-        if (rec.status != STATUS_RESOLVED && rec.status != STATUS_VOIDED) {
-            revert Errors.MarketNotFinalized();
-        }
+        _requireFinalized(rec.market);
         uint256 id = outcomeIdx == 0 ? rec.yesId : rec.noId;
         IOutcomeToken6909 tok = IOutcomeToken6909(outcomeToken);
         if (tok.balanceOf(address(this), id) < amount) revert Errors.InvalidAmount();
-        tok.approve(binarySettlement, id, amount);
-        IBinarySettlement(binarySettlement).redeem(marketId, outcomeIdx, amount);
-        tok.approve(binarySettlement, id, 0);
+        tok.approve(binaryMarketsModule, id, amount);
+        IBinaryMarketsModule(binaryMarketsModule)
+            .redeem(rec.originOperatorId, rec.originVenueId, marketId, outcomeIdx, amount);
+        tok.approve(binaryMarketsModule, id, 0);
         _accrueFees();
     }
 

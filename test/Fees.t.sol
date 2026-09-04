@@ -157,7 +157,7 @@ contract VaultFeeHarvestTest is VaultTestBase {
         vault.syncMarket(MARKET_ID);
         outcomes.mint(address(vault), YES_ID, 5 ether);
         module.setMarket(MARKET_ID, address(pool), YES_ID, NO_ID, 4);
-        asset.mint(address(settlement), 5 ether);
+        asset.mint(address(module), 5 ether);
         uint256 supply = vault.totalSupply();
         vm.prank(operator);
         vault.redeem(MARKET_ID, 0, 5 ether);
@@ -202,7 +202,7 @@ contract VaultFeeHarvestTest is VaultTestBase {
         asset.mint(address(vault), 20 ether);
         vault.harvestFees();
         vm.prank(operator);
-        vault.placeOrder(MARKET_ID, BotVault.Side.BUY_YES, 1e18, 90 ether, 1, 0);
+        vault.placeOrder(MARKET_ID, BotVault.Side.BUY_YES, 1_000_000, 90 ether, 1, 0);
         uint256 idle = asset.balanceOf(address(vault));
         assertLe(vault.maxWithdraw(feeTo), idle);
 
